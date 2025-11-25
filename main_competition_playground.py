@@ -1,7 +1,7 @@
 from mable.examples import environment, fleets, companies
 import os
 
-os.chdir(r"B:\Google Drive Sync\UoS MSc Artificial Intelligence\Intelligent Agents\Labs\Lab 3")
+os.chdir(r"G:\Other computers\Sapphire 2\Google Drive Sync\UoS MSc Artificial Intelligence\Intelligent Agents\Labs\Silicon Seas")
 print("Current working directory:", os.getcwd())
 
 import groupn

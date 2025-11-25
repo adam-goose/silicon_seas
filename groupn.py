@@ -128,77 +128,6 @@ class CompanyZ6(TradingCompany):
 
 
     # -------------------------------------------------------------
-    #                       HEURISTICS MODULE
-    # -------------------------------------------------------------
-
-    # ---------------- HEURISTIC SETTINGS ----------------
-
-    # Enable / disable heuristics
-    USE_H_DISTANCE = False
-    USE_H_TIME     = False
-    USE_H_FUTURE   = True
-
-    # Per-heuristic scaling (alpha values)
-    ALPHA_DISTANCE = 1.0     # boosts/penalises distance impact
-    ALPHA_TIME     = 1.0     # boosts/penalises time window impact
-    ALPHA_FUTURE   = 1.0     # boosts/penalises future positioning
-
-
-    def h_distance_to_pickup(self, vessel, trade):
-        """
-        Heuristic: Distance-based urgency.
-        Lower distance → lower multiplier → more aggressive.
-        Higher distance → higher multiplier → less aggressive.
-        """
-        dist = self.headquarters.get_network_distance(
-            vessel.location, trade.origin_port
-        )
-
-        # normalise to [0, 1]
-        scale = min(dist / 20000, 1.0)
-
-        # multiplier:   1 ± α * something
-        return 1.0 + (self.ALPHA_DISTANCE * scale)
-
-
-    def h_time_window_slack(self, trade):
-        """
-        Heuristic: Tight windows are risky → bid higher.
-                Loose windows are flexible → bid lower.
-        """
-        start, end = trade.time_window[0], trade.time_window[-1]
-        slack = max(0, end - start)
-
-        scale = min(slack / 5000, 1.0)
-
-        # tight window → scale small → higher multiplier
-        return 1.0 + (self.ALPHA_TIME * (1 - scale))
-
-
-    def h_future_positioning(self, trade):
-        """
-        Heuristic: If the destination is close to future trade origins,
-        we want to win it → bid lower.
-        """
-        if not getattr(self, "_future_trades", None):
-            return 1.0
-
-        dest = trade.destination_port
-
-        # nearest future origin
-        d = min(
-            self.headquarters.get_network_distance(dest, ft.origin_port)
-            for ft in self._future_trades
-        )
-
-        scale = min(d / 15000, 1.0)
-
-        # closer future → lower multiplier
-        return 1.0 + (self.ALPHA_FUTURE * (1 - scale))
-
-
-
-    # -------------------------------------------------------------
     #   BIDDING STRATEGY  (CLEAN + SAFE)
     # -------------------------------------------------------------
     def inform(self, trades):
@@ -221,6 +150,10 @@ class CompanyZ6(TradingCompany):
 
     # --- Find the vessel assigned to a trade ---
     def _find_vessel_for_trade(self, trade):
+        """
+        Currently unused, but may be helpful for future strategies.
+        :return: vessel assigned to the trade, or None if not found
+        """
         return self._trade_to_vessel.get(trade, None)
 
     def _inform_internal(self, trades):
@@ -238,22 +171,7 @@ class CompanyZ6(TradingCompany):
             # Find the vessel assigned to this trade in the proposed schedule
             vessel = self._find_vessel_for_trade(trade)
 
-            # ---------------- APPLY HEURISTICS ----------------
-
-            # Base bid multiplier
-            multiplier = 1.0
-
-            # If heuristics are enabled, adjust the bid
-            if self.USE_H_DISTANCE:
-                multiplier *= self.h_distance_to_pickup(vessel, trade)
-
-            if self.USE_H_TIME:
-                multiplier *= self.h_time_window_slack(trade)
-
-            if self.USE_H_FUTURE:
-                multiplier *= self.h_future_positioning(trade)
-
-            bid_value = base_cost * multiplier
+            bid_value = base_cost
 
             # Record the bid
             bids.append(Bid(amount=bid_value, trade=trade))
