@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from mable import cli
 import numpy as np
 
+#Set to current directory (should work on different machines)
 os.chdir(os.getcwd())
 
 def profit(metrics_file_name):
