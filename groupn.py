@@ -2,6 +2,7 @@ import os
 from mable.cargo_bidding import TradingCompany, Bid
 from mable.examples import environment, fleets
 from mable.transport_operation import ScheduleProposal
+import random
 
 class CompanyZ6(TradingCompany):
     """
@@ -38,45 +39,138 @@ class CompanyZ6(TradingCompany):
             print(type(e).__name__, e)
             raise
 
-    # -------------------------------------------------------------
-    #   CORE INSERTION SCHEDULING LOGIC
-    # -------------------------------------------------------------
+    # ============================================================
+    #                  MULTI-START CONFIGURATION
+    # ============================================================
+
+    # Maximum number of shuffles to consider when trade count is small.
+    MAX_SHUFFLES = 10
+
+    def _adaptive_shuffle_count(self, n_trades):
+        """
+        Decide how many reshuffles to use depending on how
+        many trades arrive in this auction.
+
+        If we expect about 5–50 trades per auction.
+
+        Strategy:
+        - Few trades  (5–10): explore heavily (4–6 shuffles)
+        - Medium      (11–25): moderate exploration (2–3)
+        - Large       (26–50): light exploration (1–2)
+        - Very large  (50+):   just 1 pass (too expensive)
+
+        The goal: keep runtime low but still significantly improve
+        final vessel allocation quality.
+        """
+
+        if n_trades <= 10:
+            return self.MAX_SHUFFLES               # fully explore
+        if n_trades <= 25:
+            return max(3, self.MAX_SHUFFLES // 2)  # mid exploration
+        if n_trades <= 50:
+            return 2                                # minimal exploration
+        return 1                                    # fallback for huge batches
+
+
+    # ============================================================
+    #                MULTI-START PROPOSAL WRAPPER
+    # ============================================================
+
     def _propose_schedules_internal(self, trades):
         """
-        For each trade:
-          - try every vessel
-          - try every pickup/dropoff combination in its schedule
-          - keep the feasible schedule with minimum completion time
-          - record that schedule + estimated cost
+        MULTI-START INSERTION STRATEGY
+        --------------------------------
+        We try multiple *different random permutations* of the incoming
+        trades and run the classic insertion logic on each one.
 
-        Returned ScheduleProposal contains:
-          - schedules:   {vessel : updated schedule}
-          - scheduled_trades: list of trades we can actually do
-          - costs:       {trade : estimated execution cost}
+        Why?
+        ----
+        Insertion order has massive influence on final schedules.
+        Some permutations yield far better vessel allocations.
+
+        This wrapper:
+        - Chooses K = adaptive_shuffle_count()
+        - For each shuffle:
+            * Randomise trade order
+            * Perform deterministic insertion (single pass)
+            * Score result by total completion time over all vessels
+        - Return the best scoring result
+
+        Importantly:
+        ------------
+        Costing, feasibility, constraints all remain identical.
+        This ONLY improves the exploration of trade ordering.
         """
-        print("DEBUG: _PROPOSE_SCHEDULES_INTERNAL CALLED")
+
+        print("DEBUG: MULTI-START _propose_schedules_internal")
+
+        n_trades = len(trades)
+        K = self._adaptive_shuffle_count(n_trades)
+
+        best_result = None
+        best_score = float("inf")
+
+        for _ in range(K):
+            # Randomised trade order for this attempt
+            trial_trades = trades[:]
+            random.shuffle(trial_trades)
+            print("Trial trade order:", [t.origin_port.name for t in trial_trades])
+
+            # Run deterministic insertion on this permutation
+            result = self._single_insertion_pass(trial_trades)
+
+            # Score based on sum of vessel completion times
+            score = (
+                -1000 * len(result.scheduled_trades) +     # more trades = better
+                sum(s.completion_time() for s in result.schedules.values())
+            )
+
+
+            if score < best_score:
+                best_score = score
+                best_result = result
+
+        return best_result
+
+
+    # ============================================================
+    #              ONE CLEAN INSERTION PASS (DETERMINISTIC)
+    # ============================================================
+
+    def _single_insertion_pass(self, trades):
+        """
+        This is your ORIGINAL insertion logic, isolated cleanly.
+
+        For each trade in **given order**:
+          - Try every vessel
+          - Try every pickup/dropoff insertion point
+          - Keep the feasible schedule with minimum completion time
+
+        This function is deterministic assuming 'trades' order is fixed.
+        """
 
         schedules = {}          # vessel → updated Schedule
-        scheduled_trades = []   # list of trades we CAN take
-        costs = {}              # trade → cost
-        self._trade_to_vessel = {} # trade → vessel mapping
+        scheduled_trades = []   # trades successfully inserted
+        costs = {}              # trade → cost estimate
+        self._trade_to_vessel = {}  # for use in bidding
 
         for trade in trades:
 
+            # Try assigning this trade to each vessel
             for vessel in self._fleet:
-                # Start from the current schedule (or the one we already updated)
+
+                # Either use schedule built during this pass or vessel's current schedule
                 current = schedules.get(vessel, vessel.schedule)
                 base = current.copy()
 
                 best_schedule = None
                 insertion_points = base.get_insertion_points()
 
-                # Try all pickup/dropoff combinations
+                # Try every (pickup, dropoff) insertion pair
                 for i, pickup in enumerate(insertion_points):
                     for dropoff in insertion_points[i:]:
-                        test = base.copy()
 
-                        # insert load + unload
+                        test = base.copy()
                         test.add_transportation(
                             trade,
                             location_pick_up=pickup,
@@ -86,44 +180,37 @@ class CompanyZ6(TradingCompany):
                         if not test.verify_schedule():
                             continue
 
-                        # choose schedule with earliest completion time
+                        # Choose insertion with lowest completion time
                         if (
                             best_schedule is None or
                             test.completion_time() < best_schedule.completion_time()
                         ):
                             best_schedule = test
 
-                # If feasible — assign to this vessel and stop searching
+                # If we found a feasible insertion → assign and cost it
                 if best_schedule:
                     schedules[vessel] = best_schedule
                     scheduled_trades.append(trade)
-
-                    # store the vessel assigned to this trade
                     self._trade_to_vessel[trade] = vessel
 
-                    # ---------------- Cost estimation ----------------
-                    load_t = vessel.get_loading_time(trade.cargo_type, trade.amount)
-                    load_c = vessel.get_loading_consumption(load_t)
+                    # ------------ COST CALCULATION ------------
+                    load_t   = vessel.get_loading_time(trade.cargo_type, trade.amount)
+                    load_c   = vessel.get_loading_consumption(load_t)
+                    unload_c = vessel.get_loading_consumption(load_t)  # symmetric
 
-                    # MABLE doesn't have unloading, so we mirror loading
-                    unload_t = load_t
-                    unload_c = vessel.get_loading_consumption(unload_t)
-
-                    # Travel cost
-                    dist = self.headquarters.get_network_distance(
-                        trade.origin_port,
-                        trade.destination_port
+                    dist      = self.headquarters.get_network_distance(
+                        trade.origin_port, trade.destination_port
                     )
-                    travel_t = vessel.get_travel_time(dist)
-                    travel_c = vessel.get_laden_consumption(travel_t, vessel.speed)
+                    travel_t  = vessel.get_travel_time(dist)
+                    travel_c  = vessel.get_laden_consumption(travel_t, vessel.speed)
 
-                    total_cost = load_c + unload_c + travel_c
-                    costs[trade] = float(total_cost)
+                    costs[trade] = float(load_c + unload_c + travel_c)
 
-                    break   # move to next trade
+                    break  # trade assigned → move to next trade
 
-            # If no vessel can take the trade, we simply do not schedule it.
+            # If no vessel can take the trade → drop it (normal behaviour)
 
+        # Return normal MABLE object
         return ScheduleProposal(schedules, scheduled_trades, costs)
 
 
