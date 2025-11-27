@@ -13,6 +13,19 @@ class CompanyZ6(TradingCompany):
     - No heuristics, no future trades, no opponent modelling.
     """
 
+    # ============================================================
+    #               INITIALISATION & SETUP
+    # ============================================================
+
+    # ---------------------- MULTI-START SETTINGS ----------------------
+    MAX_SHUFFLES = 1            # max random permutations to try in multi-start
+    
+    # ---------------------- LNS SETTINGS ----------------------
+    LNS_ENABLED      = False      # master switch
+    LNS_ITERATIONS   = 10        # how many LNS tries per vessel
+    LNS_REMOVALS     = 0         # how many trades to remove each time
+
+
     # -------------------------------------------------------------
     #   FUTURE TRADE HOOK (not used yet, but harmless to keep)
     # -------------------------------------------------------------
@@ -27,24 +40,28 @@ class CompanyZ6(TradingCompany):
     # -------------------------------------------------------------
     #   SCHEDULING WRAPPER
     # -------------------------------------------------------------
-    def propose_schedules(self, trades):
+    def propose_schedules(self, trades, post_auction=False):
         """
-        Wrapper so we can print any scheduling errors clearly.
+        Wrapper so we can apply different scheduling strategies
+        depending on whether we're in the bidding phase (inform)
+        or the post-auction phase (receive).
+
+        post_auction = False → multi-start, no LNS
+        post_auction = True  → deterministic insertion + LNS
         """
-        print("DEBUG: PROPOSE_SCHEDULES CALLED")
         try:
-            return self._propose_schedules_internal(trades)
+            return self._propose_schedules_internal(trades, post_auction)
         except Exception as e:
             print("\n=== PROPOSE_SCHEDULES ERROR ===")
             print(type(e).__name__, e)
             raise
+
 
     # ============================================================
     #                  MULTI-START CONFIGURATION
     # ============================================================
 
     # Maximum number of shuffles to consider when trade count is small.
-    MAX_SHUFFLES = 10
 
     def _adaptive_shuffle_count(self, n_trades):
         """
@@ -76,33 +93,37 @@ class CompanyZ6(TradingCompany):
     #                MULTI-START PROPOSAL WRAPPER
     # ============================================================
 
-    def _propose_schedules_internal(self, trades):
+    def _propose_schedules_internal(self, trades, post_auction):
         """
-        MULTI-START INSERTION STRATEGY
-        --------------------------------
-        We try multiple *different random permutations* of the incoming
-        trades and run the classic insertion logic on each one.
+        PRE-AUCTION (inform):
+            - Multi-start permutations
+            - Deterministic insertion
+            - NO LNS
 
-        Why?
-        ----
-        Insertion order has massive influence on final schedules.
-        Some permutations yield far better vessel allocations.
-
-        This wrapper:
-        - Chooses K = adaptive_shuffle_count()
-        - For each shuffle:
-            * Randomise trade order
-            * Perform deterministic insertion (single pass)
-            * Score result by total completion time over all vessels
-        - Return the best scoring result
-
-        Importantly:
-        ------------
-        Costing, feasibility, constraints all remain identical.
-        This ONLY improves the exploration of trade ordering.
+        POST-AUCTION (receive):
+            - Deterministic insertion only
+            - THEN LNS refinement
         """
 
-        print("DEBUG: MULTI-START _propose_schedules_internal")
+        # ---------------------------------------------------------
+        #           POST-AUCTION BRANCH (receive)
+        # ---------------------------------------------------------
+        if post_auction:
+            print("\n--- POST-AUCTION SCHEDULING PASS ---")
+            # One clean deterministic insertion
+            base_result = self._single_insertion_pass(trades)
+
+            # Optional LNS improvement
+            if self.LNS_ENABLED:
+                return self._apply_lns(base_result)
+
+            return base_result
+
+        # ---------------------------------------------------------
+        #           PRE-AUCTION BRANCH (inform)
+        # ---------------------------------------------------------
+
+        print("\n--- PRE-AUCTION MULTI-START SCHEDULING ---")
 
         n_trades = len(trades)
         K = self._adaptive_shuffle_count(n_trades)
@@ -111,26 +132,68 @@ class CompanyZ6(TradingCompany):
         best_score = float("inf")
 
         for _ in range(K):
-            # Randomised trade order for this attempt
             trial_trades = trades[:]
             random.shuffle(trial_trades)
-            print("Trial trade order:", [t.origin_port.name for t in trial_trades])
 
-            # Run deterministic insertion on this permutation
             result = self._single_insertion_pass(trial_trades)
 
-            # Score based on sum of vessel completion times
+            # Multi-start scoring
             score = (
-                -1000 * len(result.scheduled_trades) +     # more trades = better
+                -1000 * len(result.scheduled_trades) +
                 sum(s.completion_time() for s in result.schedules.values())
             )
-
 
             if score < best_score:
                 best_score = score
                 best_result = result
 
         return best_result
+
+
+    def _apply_lns(self, initial_result):
+        """
+        Local Neighbourhood Search applied AFTER the auction,
+        using only the trades we actually won.
+
+        Algorithm:
+            - Start with deterministic insertion result
+            - Each iteration:
+                * randomly remove k trades
+                * rebuild schedule via deterministic insertion
+                * accept if better
+        """
+
+        R = initial_result
+        current_trades = list(R.scheduled_trades)
+
+        def schedule_score(prop):
+            return (
+                -1000 * len(prop.scheduled_trades) +
+                sum(s.completion_time() for s in prop.schedules.values())
+            )
+
+        best_score = schedule_score(R)
+
+        for _ in range(self.LNS_ITERATIONS):
+
+            if not current_trades:
+                break
+
+            k = min(self.LNS_REMOVALS, len(current_trades))
+            removed = random.sample(current_trades, k)
+            kept = [t for t in current_trades if t not in removed]
+
+            reinsertion_order = kept + removed
+
+            candidate = self._single_insertion_pass(reinsertion_order)
+            cand_score = schedule_score(candidate)
+
+            if cand_score < best_score:
+                R = candidate
+                current_trades = list(candidate.scheduled_trades)
+                best_score = cand_score
+
+        return R
 
 
     # ============================================================
@@ -215,8 +278,11 @@ class CompanyZ6(TradingCompany):
 
 
     # -------------------------------------------------------------
-    #   BIDDING STRATEGY  (CLEAN + SAFE)
+    #   Inform - BIDDING STRATEGY
     # -------------------------------------------------------------
+    
+    # --- Inform wrapper with error handling ---
+    
     def inform(self, trades):
         """
         Bidding strategy:
@@ -236,6 +302,7 @@ class CompanyZ6(TradingCompany):
             raise
 
     # --- Find the vessel assigned to a trade ---
+    
     def _find_vessel_for_trade(self, trade):
         """
         Currently unused, but may be helpful for future strategies.
@@ -243,8 +310,10 @@ class CompanyZ6(TradingCompany):
         """
         return self._trade_to_vessel.get(trade, None)
 
+    # --- Inform internal logic ---
+
     def _inform_internal(self, trades):
-        proposal = self.propose_schedules(trades)
+        proposal = self.propose_schedules(trades, post_auction=False)
         bids = []
 
         for trade in trades:
@@ -264,6 +333,23 @@ class CompanyZ6(TradingCompany):
             bids.append(Bid(amount=bid_value, trade=trade))
 
         return bids
+
+    # -------------------------------------------------------------
+    #   Receive - POST-AUCTION SCHEDULING
+    # -------------------------------------------------------------
+
+    def receive(self, contracts, auction_ledger=None, *args, **kwargs):
+        print("\n=== ENTERING CUSTOM RECEIVE ===")
+        trades = [c.trade for c in contracts]
+
+        # POST-AUCTION scheduling pass (deterministic + LNS)
+        scheduling_proposal = self.propose_schedules(trades, post_auction=True)
+
+        rejected = self.apply_schedules(scheduling_proposal.schedules)
+
+        if rejected:
+            logger.error(f"{len(rejected)} rejected trades.")
+
 
 # ---------------- SIMULATION BOOTSTRAP ----------------
 
