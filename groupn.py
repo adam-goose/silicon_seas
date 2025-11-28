@@ -21,9 +21,9 @@ class CompanyZ6(TradingCompany):
     MAX_SHUFFLES = 1            # max random permutations to try in multi-start
     
     # ---------------------- LNS SETTINGS ----------------------
-    LNS_ENABLED      = False      # master switch
+    LNS_ENABLED      = True      # master switch
     LNS_ITERATIONS   = 10        # how many LNS tries per vessel
-    LNS_REMOVALS     = 0         # how many trades to remove each time
+    LNS_REMOVALS     = 2         # how many trades to remove each time
 
 
     # -------------------------------------------------------------
@@ -42,12 +42,16 @@ class CompanyZ6(TradingCompany):
     # -------------------------------------------------------------
     def propose_schedules(self, trades, post_auction=False):
         """
-        Wrapper so we can apply different scheduling strategies
-        depending on whether we're in the bidding phase (inform)
-        or the post-auction phase (receive).
+        Scheduling wrapper used by both:
+        - inform()          → post_auction = False
+        - receive()         → post_auction = True
 
-        post_auction = False → multi-start, no LNS
-        post_auction = True  → deterministic insertion + LNS
+        post_auction=False:
+            Multi-start exploration for bidding.
+
+        post_auction=True:
+            Deterministic scheduling + LNS refinement
+            (must schedule ALL won trades, zero penalties).
         """
         try:
             return self._propose_schedules_internal(trades, post_auction)
@@ -101,26 +105,44 @@ class CompanyZ6(TradingCompany):
             - NO LNS
 
         POST-AUCTION (receive):
-            - Deterministic insertion only
-            - THEN LNS refinement
+            - Deterministic insertion (must keep ALL trades)
+            - Safe fallback if insertion drops trades
+            - LNS refinement (only accepts full-trade schedules)
         """
 
         # ---------------------------------------------------------
-        #           POST-AUCTION BRANCH (receive)
+        #                POST-AUCTION (receive)
         # ---------------------------------------------------------
         if post_auction:
             print("\n--- POST-AUCTION SCHEDULING PASS ---")
-            # One clean deterministic insertion
-            base_result = self._single_insertion_pass(trades)
 
-            # Optional LNS improvement
+            required = set(trades)
+
+            # 1. Deterministic insertion using current order
+            base_result = self._single_insertion_pass(trades)
+            base_set = set(base_result.scheduled_trades)
+
+            # If ANY won trade is missing → try fallback
+            if base_set != required:
+                print("WARNING: Base insertion dropped trades. Trying fallback order.")
+                reversed_order = list(trades)[::-1]
+                fallback = self._single_insertion_pass(reversed_order)
+
+                if set(fallback.scheduled_trades) == required:
+                    base_result = fallback
+                else:
+                    print("CRITICAL: Both base and fallback failed to schedule all trades.")
+                    # Return best possible schedule; avoid LNS that could worsen it.
+                    return base_result
+
+            # 2. LNS improvement on valid base solution
             if self.LNS_ENABLED:
                 return self._apply_lns(base_result)
 
             return base_result
 
         # ---------------------------------------------------------
-        #           PRE-AUCTION BRANCH (inform)
+        #              PRE-AUCTION (inform)
         # ---------------------------------------------------------
 
         print("\n--- PRE-AUCTION MULTI-START SCHEDULING ---")
@@ -137,7 +159,6 @@ class CompanyZ6(TradingCompany):
 
             result = self._single_insertion_pass(trial_trades)
 
-            # Multi-start scoring
             score = (
                 -1000 * len(result.scheduled_trades) +
                 sum(s.completion_time() for s in result.schedules.values())
@@ -152,25 +173,21 @@ class CompanyZ6(TradingCompany):
 
     def _apply_lns(self, initial_result):
         """
-        Local Neighbourhood Search applied AFTER the auction,
-        using only the trades we actually won.
+        Local Neighbourhood Search applied AFTER the auction.
 
-        Algorithm:
-            - Start with deterministic insertion result
-            - Each iteration:
-                * randomly remove k trades
-                * rebuild schedule via deterministic insertion
-                * accept if better
+        Guarantees:
+            - NEVER drops a won trade
+            - Only accepts candidates with full required set
+            - Safe scoring (no trade-count bias)
+            - Deterministic insertion + destroy/repair loops
         """
 
+        required = set(initial_result.scheduled_trades)
         R = initial_result
         current_trades = list(R.scheduled_trades)
 
         def schedule_score(prop):
-            return (
-                -1000 * len(prop.scheduled_trades) +
-                sum(s.completion_time() for s in prop.schedules.values())
-            )
+            return sum(s.completion_time() for s in prop.schedules.values())
 
         best_score = schedule_score(R)
 
@@ -186,6 +203,13 @@ class CompanyZ6(TradingCompany):
             reinsertion_order = kept + removed
 
             candidate = self._single_insertion_pass(reinsertion_order)
+
+            candidate_set = set(candidate.scheduled_trades)
+
+            # HARD SAFETY CHECK — must include ALL required trades
+            if candidate_set != required:
+                continue
+
             cand_score = schedule_score(candidate)
 
             if cand_score < best_score:
@@ -212,6 +236,7 @@ class CompanyZ6(TradingCompany):
         This function is deterministic assuming 'trades' order is fixed.
         """
 
+        vessel_last_port = {}  # vessel → last destination port in this hypothetical schedule
         schedules = {}          # vessel → updated Schedule
         scheduled_trades = []   # trades successfully inserted
         costs = {}              # trade → cost estimate
@@ -257,19 +282,39 @@ class CompanyZ6(TradingCompany):
                     self._trade_to_vessel[trade] = vessel
 
                     # ------------ COST CALCULATION ------------
+
+                    # 1. Where is the vessel BEFORE this trade?
+                    if vessel in vessel_last_port:
+                        prev_loc = vessel_last_port[vessel]
+                    else:
+                        # No trades assigned yet – use the vessel's ACTUAL current port
+                        prev_loc = vessel.location
+
+                    # EMPTY travel
+                    dist_empty = self.headquarters.get_network_distance(
+                        prev_loc, trade.origin_port
+                    )
+                    t_empty = vessel.get_travel_time(dist_empty)
+                    c_empty = vessel.get_ballast_consumption(t_empty, vessel.speed)
+
+                    # Loading/unloading
                     load_t   = vessel.get_loading_time(trade.cargo_type, trade.amount)
                     load_c   = vessel.get_loading_consumption(load_t)
-                    unload_c = vessel.get_loading_consumption(load_t)  # symmetric
+                    unload_c = vessel.get_loading_consumption(load_t)
 
-                    dist      = self.headquarters.get_network_distance(
+                    # LOADED travel
+                    dist_loaded = self.headquarters.get_network_distance(
                         trade.origin_port, trade.destination_port
                     )
-                    travel_t  = vessel.get_travel_time(dist)
-                    travel_c  = vessel.get_laden_consumption(travel_t, vessel.speed)
+                    t_loaded = vessel.get_travel_time(dist_loaded)
+                    c_loaded = vessel.get_laden_consumption(t_loaded, vessel.speed)
 
-                    costs[trade] = float(load_c + unload_c + travel_c)
+                    # Total cost estimate
+                    costs[trade] = float(c_empty + c_loaded + load_c + unload_c)
 
-                    break  # trade assigned → move to next trade
+                    # Update vessel's last known location for next trade
+                    vessel_last_port[vessel] = trade.destination_port
+
 
             # If no vessel can take the trade → drop it (normal behaviour)
 
@@ -340,15 +385,19 @@ class CompanyZ6(TradingCompany):
 
     def receive(self, contracts, auction_ledger=None, *args, **kwargs):
         print("\n=== ENTERING CUSTOM RECEIVE ===")
+
+        # Trades we actually won this auction
         trades = [c.trade for c in contracts]
 
         # POST-AUCTION scheduling pass (deterministic + LNS)
         scheduling_proposal = self.propose_schedules(trades, post_auction=True)
 
+        # Apply schedule to environment – MABLE enforces feasibility
         rejected = self.apply_schedules(scheduling_proposal.schedules)
 
         if rejected:
             logger.error(f"{len(rejected)} rejected trades.")
+
 
 
 # ---------------- SIMULATION BOOTSTRAP ----------------
