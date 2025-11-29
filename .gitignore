@@ -1,16 +1,19 @@
-# Python cache
+# Python bytecode / cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 # Virtual environments
 .venv/
+venv/
 
 # MABLE metrics output
 metrics_competition_*.json
 
-# Wheels / local packages
+# Local wheels / packages
 *.whl
 
-# VS Code
+# Editor configs
 .vscode/
-
+.idea/
