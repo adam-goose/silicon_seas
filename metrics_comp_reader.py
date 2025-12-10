@@ -3,12 +3,13 @@ import json
 import matplotlib.pyplot as plt
 from mable import cli
 import numpy as np
+import pandas as pd
 
 #Set to current directory (should work on different machines)
 os.chdir(os.getcwd())
 
-def profit(metrics_file_name):
-
+def profit(metrics_file_name) -> dict:
+    incomes = {}
     #print(f"Overview for {metrics_file_name}.")
     with open(metrics_file_name, "r") as f:
         metrics = json.load(f)
@@ -26,62 +27,68 @@ def profit(metrics_file_name):
         all_payments = [d["payment"] for d in all_outcomes_company]
         revenue += sum(all_payments)
         income = revenue - cost - penalty
-        print(income)
-        #return income
+        incomes.update({one_company_key : income})
+
+    print(incomes.values())
+    return incomes
 
 
-files = [f for f in os.listdir()
-         if f.startswith("metrics_competition") and f.endswith(".json")]
+def graph():
+    files = [f for f in os.listdir() if f.startswith("metrics_competition") and f.endswith(".json")]
 
 
-plt.figure()
-labels = []
+    plt.figure()
+    labels = []
 
-for filename in files:
-    profit(filename)
-    with open(filename) as f:
-        data = json.load(f)
-    # print(dict(filename))
-    # cli.task_metrics_overview(dict(filename))
+    for filename in files:
+        profit(filename)
+        with open(filename) as f:
+            data = json.load(f)
+        # print(dict(filename))
+        # cli.task_metrics_overview(dict(filename))
 
-    window_sums = []      # payment per auction window
-    total_payment = 0
-    fulfilled = 0
-    unfulfilled = 0
+        window_sums = []      # payment per auction window
+        total_payment = 0
+        fulfilled = 0
+        unfulfilled = 0
 
-    for auction in data["global_metrics"]["auction_outcomes"]:
-        company_entry = auction.get("0", [])
-        
-        window_total = 0
-        for contract in company_entry:
-            p = contract.get("payment", 0)
-            window_total += p
-            total_payment += p
+        for auction in data["global_metrics"]["auction_outcomes"]:
+            company_entry = auction.get("0", [])
+            
+            window_total = 0
+            for contract in company_entry:
+                p = contract.get("payment", 0)
+                window_total += p
+                total_payment += p
 
-            if contract.get("fulfilled", False):
-                fulfilled += 1
-            else:
-                unfulfilled += 1
+                if contract.get("fulfilled", False):
+                    fulfilled += 1
+                else:
+                    unfulfilled += 1
 
-        # if company 0 had no trades this window, window_total = 0
-        window_sums.append(window_total)
+            # if company 0 had no trades this window, window_total = 0
+            window_sums.append(window_total)
 
-    #print(f"{filename} => payment={total_payment:.2f}, " f"fulfilled={fulfilled}, unfulfilled={unfulfilled}")
+        #print(f"{filename} => payment={total_payment:.2f}, " f"fulfilled={fulfilled}, unfulfilled={unfulfilled}")
 
-    # cumulative over windows
-    cumulative = []
-    running = 0
-    for w in window_sums:
-        running += w
-        cumulative.append(running)
+        # cumulative over windows
+        cumulative = []
+        running = 0
+        for w in window_sums:
+            running += w
+            cumulative.append(running)
 
-    plt.plot(cumulative)
-    labels.append(filename)
+        plt.plot(cumulative)
+        labels.append(filename)
 
-plt.title("Cumulative Payments per Auction Window (Company 0)")
-plt.xlabel("Auction Window Index")
-plt.ylabel("Cumulative Payment")
-plt.grid(True)
-plt.legend(labels)
-plt.tight_layout()
-#plt.show()
+    plt.title("Cumulative Payments per Auction Window (Company 0)")
+    plt.xlabel("Auction Window Index")
+    plt.ylabel("Cumulative Payment")
+    plt.grid(True)
+    plt.legend(labels)
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    graph()
